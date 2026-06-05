@@ -61,6 +61,13 @@ int main()
 #define AUDIO_OUT_BUF_SAMPLES 8192
 #define AUDIO_QUEUE_SIZE   16
 
+/* ── 播放列表项 ── */
+struct pl_item {
+    char      path[512];
+    double    duration;      /* 秒，0 表示未探测 */
+    lv_obj_t *item_obj;      /* 列表中的 UI 控件，给 timer 更新时长用 */
+};
+
 /* ── 播放器上下文，解码线程持续使用 ── */
 struct video_ctx {
     AVFormatContext  *fmt_ctx;
@@ -112,7 +119,7 @@ static uint8_t           __attribute__((aligned(64))) g_video_buf[2][CANVAS_W * 
 static int               g_video_buf_idx;
 
 /* ── 播放列表 ── */
-static char **g_playlist;
+static struct pl_item *g_playlist;
 static int   g_playlist_count;
 static int   g_playlist_cap;
 static int   g_playlist_index;
@@ -122,6 +129,7 @@ static int   g_pause;
 static lv_obj_t *g_audio_label;
 static lv_obj_t *g_file_label;
 static lv_obj_t *g_pp_btn_label;
+static lv_obj_t *g_list_btn;
 static lv_obj_t *g_progress_slider;
 static lv_obj_t *g_time_cur_label;
 static lv_obj_t *g_time_total_label;
@@ -129,6 +137,13 @@ static double g_duration;
 
 static lv_obj_t         *g_vol_slider;
 static lv_obj_t         *g_vol_label;
+
+/* ── 播放列表 UI ── */
+static lv_obj_t     *g_playlist_page;
+static lv_obj_t     *g_playlist_scroll;
+static lv_timer_t   *g_probe_timer;
+static int           g_probe_index;
+static int           g_playlist_open;
 
 static snd_ctl_t          *g_ctl;
 static snd_ctl_elem_id_t  *g_ctl_id;
@@ -171,13 +186,71 @@ static void btn_pp_cb(lv_event_t *e)
 static void btn_prev_cb(lv_event_t *e)
 {
     (void)e;
+    if (g_playlist_open) {
+        if (g_probe_timer) {
+            lv_timer_del(g_probe_timer);
+            g_probe_timer = NULL;
+        }
+        lv_obj_del(g_playlist_page);
+        g_playlist_page = NULL;
+        g_playlist_open = 0;
+    }
     g_skip_dir = -1;
 }
 
 static void btn_next_cb(lv_event_t *e)
 {
     (void)e;
+    if (g_playlist_open) {
+        if (g_probe_timer) {
+            lv_timer_del(g_probe_timer);
+            g_probe_timer = NULL;
+        }
+        lv_obj_del(g_playlist_page);
+        g_playlist_page = NULL;
+        g_playlist_open = 0;
+    }
     g_skip_dir = +1;
+}
+
+/* ── 播放列表相关前置声明 ── */
+static void playlist_page_create(void);
+
+/* ── 播放列表浮层开关 ── */
+static void list_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_playlist_open) {
+        if (g_probe_timer) {
+            lv_timer_del(g_probe_timer);
+            g_probe_timer = NULL;
+        }
+        lv_obj_del(g_playlist_page);
+        g_playlist_page = NULL;
+        g_playlist_open = 0;
+    } else {
+        playlist_page_create();
+        g_playlist_open = 1;
+    }
+}
+
+/* ── 播放列表条目点击 ── */
+static void playlist_item_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+
+    if (g_probe_timer) {
+        lv_timer_del(g_probe_timer);
+        g_probe_timer = NULL;
+    }
+    lv_obj_del(g_playlist_page);
+    g_playlist_page = NULL;
+    g_playlist_open = 0;
+
+    if (idx == g_playlist_index) return;
+
+    g_skip_dir = idx - g_playlist_index;
+    g_switch_file = 1;
 }
 
 #define CONFIG_PATH "/userdata/player.conf"
@@ -329,6 +402,196 @@ static void vol_slider_cb(lv_event_t *e)
     if (!g_vol_init_done) return;
     int step = (int)lv_slider_get_value(g_vol_slider);
     vol_apply(step);
+}
+
+/* 探测文件时长（秒），0 表示失败 */
+static double probe_duration(const char *path)
+{
+    AVFormatContext *fmt = NULL;
+    double dur = 0;
+    if (avformat_open_input(&fmt, path, NULL, NULL) >= 0) {
+        if (avformat_find_stream_info(fmt, NULL) >= 0) {
+            if (fmt->duration != AV_NOPTS_VALUE)
+                dur = (double)fmt->duration / AV_TIME_BASE;
+        }
+        avformat_close_input(&fmt);
+    }
+    return dur;
+}
+
+/* 懒加载时长：定时器回调，每次探测一首 */
+static void probe_next_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    while (g_probe_index < g_playlist_count &&
+           g_playlist[g_probe_index].duration > 0.01) {
+        g_probe_index++;
+    }
+    if (g_probe_index >= g_playlist_count) {
+        lv_timer_del(g_probe_timer);
+        g_probe_timer = NULL;
+        return;
+    }
+
+    double dur = probe_duration(g_playlist[g_probe_index].path);
+    g_playlist[g_probe_index].duration = dur;
+
+    /* 通过 item_obj 直接找到时长 label，不受滚动条子对象干扰 */
+    lv_obj_t *item = g_playlist[g_probe_index].item_obj;
+    if (item) {
+        lv_obj_t *dur_lbl = lv_obj_get_child(item, 2);
+        if (dur_lbl) {
+            char buf[16];
+            format_time((int)dur, buf, sizeof(buf));
+            lv_label_set_text(dur_lbl, buf);
+        }
+    }
+    g_probe_index++;
+}
+
+/* ── 创建播放列表浮层 ── */
+static void playlist_page_create(void)
+{
+    /* 1. 浮层容器 */
+    g_playlist_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_playlist_page, 468, 600);
+    lv_obj_align(g_playlist_page, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(g_playlist_page, lv_color_hex(0x1E1E2E), 0);
+    lv_obj_set_style_bg_opa(g_playlist_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(g_playlist_page, 14, 0);
+    lv_obj_set_style_pad_all(g_playlist_page, 0, 0);
+    lv_obj_set_style_border_width(g_playlist_page, 0, 0);
+
+    /* 2. 标题栏 */
+    lv_obj_t *title = lv_label_create(g_playlist_page);
+    lv_label_set_text(title, "Playlist");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 12);
+
+    /* 关闭按钮 */
+    lv_obj_t *close_btn = lv_btn_create(g_playlist_page);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, list_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 3. 可滚动曲目列表 */
+    g_playlist_scroll = lv_obj_create(g_playlist_page);
+    lv_obj_set_size(g_playlist_scroll, 452, 528);
+    lv_obj_align(g_playlist_scroll, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_flex_flow(g_playlist_scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(g_playlist_scroll, LV_DIR_VER);
+    lv_obj_set_style_pad_all(g_playlist_scroll, 8, 0);
+    lv_obj_set_style_pad_row(g_playlist_scroll, 2, 0);
+    lv_obj_set_style_border_width(g_playlist_scroll, 0, 0);
+    lv_obj_set_style_bg_opa(g_playlist_scroll, LV_OPA_TRANSP, 0);
+
+    /* 4. 预设样式 */
+    static lv_style_t style_item, style_item_pr, style_item_cur;
+    static int style_inited;
+    if (!style_inited) {
+        lv_style_init(&style_item);
+        lv_style_set_bg_opa(&style_item, LV_OPA_TRANSP);
+        lv_style_set_radius(&style_item, 8);
+
+        lv_style_init(&style_item_pr);
+        lv_style_set_bg_opa(&style_item_pr, LV_OPA_20);
+        lv_style_set_bg_color(&style_item_pr, lv_color_hex(0x4C4C6C));
+
+        lv_style_init(&style_item_cur);
+        lv_style_set_bg_opa(&style_item_cur, LV_OPA_30);
+        lv_style_set_bg_color(&style_item_cur, lv_color_hex(0x3273DC));
+        style_inited = 1;
+    }
+
+    /* 5. 遍历创建每条曲目 */
+    static lv_style_t style_item_grid;
+    static int grid_style_inited;
+    if (!grid_style_inited) {
+        lv_style_init(&style_item_grid);
+        lv_style_set_layout(&style_item_grid, LV_LAYOUT_GRID);
+        lv_style_set_pad_left(&style_item_grid, 12);
+        lv_style_set_pad_right(&style_item_grid, 12);
+        static lv_coord_t row_h[2] = {28, LV_GRID_TEMPLATE_LAST};
+        lv_style_set_grid_row_dsc_array(&style_item_grid, row_h);
+        static lv_coord_t col_w[4] = {
+            LV_GRID_CONTENT, LV_GRID_FR(1),
+            LV_GRID_CONTENT, LV_GRID_TEMPLATE_LAST
+        };
+        lv_style_set_grid_column_dsc_array(&style_item_grid, col_w);
+        grid_style_inited = 1;
+    }
+
+    for (int i = 0; i < g_playlist_count; i++) {
+        const char *full = g_playlist[i].path;
+        const char *name = strrchr(full, '/') ?
+                           strrchr(full, '/') + 1 : full;
+
+        lv_obj_t *item = lv_obj_create(g_playlist_scroll);
+        lv_obj_remove_style_all(item);
+        lv_obj_set_size(item, lv_pct(100), 58);
+        lv_obj_add_style(item, &style_item_grid, 0);
+        lv_obj_add_style(item, &style_item, 0);
+        lv_obj_add_style(item, &style_item_pr, LV_STATE_PRESSED);
+        if (i == g_playlist_index)
+            lv_obj_add_style(item, &style_item_cur, 0);
+        lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
+        g_playlist[i].item_obj = item;  /* 保存引用，供 timer 更新时长 */
+
+        lv_obj_add_event_cb(item, playlist_item_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        /* 序号 */
+        lv_obj_t *idx_lbl = lv_label_create(item);
+        if (i == g_playlist_index) {
+            lv_label_set_text_fmt(idx_lbl, "%s %02d",
+                                  LV_SYMBOL_PLAY, i + 1);
+            lv_obj_set_style_text_color(idx_lbl,
+                lv_color_hex(0x48C774), 0);
+        } else {
+            lv_label_set_text_fmt(idx_lbl, "  %02d", i + 1);
+            lv_obj_set_style_text_color(idx_lbl,
+                lv_color_hex(0x888888), 0);
+        }
+        lv_obj_set_style_text_font(idx_lbl, &lv_font_montserrat_18, 0);
+        lv_obj_set_grid_cell(idx_lbl, LV_GRID_ALIGN_START,
+            0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+
+        /* 文件名 */
+        lv_obj_t *nm_lbl = lv_label_create(item);
+        lv_label_set_text(nm_lbl, name);
+        lv_obj_set_style_text_color(nm_lbl, lv_color_hex(0xE0E0E0), 0);
+        lv_obj_set_style_text_font(nm_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_grid_cell(nm_lbl, LV_GRID_ALIGN_START,
+            1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+
+        /* 时长 */
+        lv_obj_t *dur_lbl = lv_label_create(item);
+        double dur = g_playlist[i].duration;
+        char tbuf[16];
+        if (dur > 0.01) {
+            int m = (int)dur / 60, s = (int)dur % 60;
+            snprintf(tbuf, sizeof(tbuf), "%d:%02d", m, s);
+        } else {
+            snprintf(tbuf, sizeof(tbuf), "--:--");
+        }
+        lv_label_set_text(dur_lbl, tbuf);
+        lv_obj_set_style_text_color(dur_lbl, lv_color_hex(0x9090A0), 0);
+        lv_obj_set_style_text_font(dur_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_grid_cell(dur_lbl, LV_GRID_ALIGN_END,
+            2, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+    }
+
+    /* 6. 滚动到当前曲目 */
+    lv_obj_t *cur = g_playlist[g_playlist_index].item_obj;
+    if (cur) lv_obj_scroll_to_view(cur, LV_ANIM_OFF);
+
+    /* 7. 启动懒加载定时器，逐个探测时长 */
+    g_probe_index = 0;
+    g_probe_timer = lv_timer_create(probe_next_cb, 200, NULL);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -888,7 +1151,7 @@ static int build_playlist(void)
     }
 
     g_playlist_cap = PLAYLIST_INIT_CAP;
-    g_playlist = malloc(g_playlist_cap * sizeof(char *));
+    g_playlist = malloc(g_playlist_cap * sizeof(struct pl_item));
     if (!g_playlist) { closedir(d); return -1; }
     g_playlist_count = 0;
 
@@ -897,16 +1160,16 @@ static int build_playlist(void)
         if (!has_ext(ent->d_name)) continue;
         if (g_playlist_count >= g_playlist_cap) {
             g_playlist_cap *= 2;
-            char **tmp = realloc(g_playlist,
-                                 g_playlist_cap * sizeof(char *));
+            struct pl_item *tmp = realloc(g_playlist,
+                                 g_playlist_cap * sizeof(struct pl_item));
             if (!tmp) { printf("[scan] realloc failed\n"); break; }
             g_playlist = tmp;
         }
-        g_playlist[g_playlist_count] = malloc(512);
-        snprintf(g_playlist[g_playlist_count], 512,
+        snprintf(g_playlist[g_playlist_count].path, 512,
                  MEDIA_DIR "/%s", ent->d_name);
+        g_playlist[g_playlist_count].duration = 0;
         printf("[scan] #%d: %s\n", g_playlist_count,
-               g_playlist[g_playlist_count]);
+               g_playlist[g_playlist_count].path);
         g_playlist_count++;
     }
     closedir(d);
@@ -917,8 +1180,6 @@ static int build_playlist(void)
 
 static void free_playlist(void)
 {
-    for (int i = 0; i < g_playlist_count; i++)
-        free(g_playlist[i]);
     free(g_playlist);
     g_playlist = NULL;
     g_playlist_count = g_playlist_cap = 0;
@@ -1145,100 +1406,198 @@ int main(int argc, char *argv[])
     lv_obj_center(g_audio_label);
     lv_obj_add_flag(g_audio_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── 进度条 ── */
+    /* ═══ 底部控制区域 (Grid 布局) ═══
+     *  行0: 进度条+时间  |  行1: 文件名  |  行2: 播放控制
+     *  行3: 音量控制    |  行4: 弹性间距  |  行5: 播放列表按钮(左下角) */
     {
-        g_time_cur_label = lv_label_create(lv_scr_act());
-        lv_label_set_text(g_time_cur_label, "00:00");
-        lv_obj_set_style_text_font(g_time_cur_label,
-            &lv_font_montserrat_14, 0);
-        lv_obj_align(g_time_cur_label, LV_ALIGN_TOP_LEFT, 8, 504);
+        lv_obj_t *bottom = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(bottom, 480, 374);
+        lv_obj_align(bottom, LV_ALIGN_TOP_MID, 0, 480);
+        lv_obj_set_style_pad_all(bottom, 10, 0);
+        lv_obj_set_style_bg_opa(bottom, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bottom, 0, 0);
+        lv_obj_clear_flag(bottom, LV_OBJ_FLAG_SCROLLABLE |
+                                   LV_OBJ_FLAG_CLICKABLE);
 
-        g_progress_slider = lv_slider_create(lv_scr_act());
-        lv_obj_set_size(g_progress_slider, 360, 10);
-        lv_obj_align(g_progress_slider, LV_ALIGN_TOP_MID, 0, 506);
-        lv_slider_set_range(g_progress_slider, 0, 1000);
+        static const lv_coord_t cols[] = {LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+        static const lv_coord_t rows[] = {
+            30,               /* row 0: 进度条行 */
+            38,               /* row 1: 文件名行 */
+            62,               /* row 2: 控制按钮行  */
+            54,               /* row 3: 音量控制行  */
+            LV_GRID_FR(1),    /* row 4: 弹性间距     */
+            64,               /* row 5: 播放列表按钮 */
+            LV_GRID_TEMPLATE_LAST
+        };
+        lv_obj_set_grid_dsc_array(bottom, cols, rows);
 
-        g_time_total_label = lv_label_create(lv_scr_act());
-        lv_label_set_text(g_time_total_label, "00:00");
-        lv_obj_set_style_text_font(g_time_total_label,
-            &lv_font_montserrat_14, 0);
-        lv_obj_align(g_time_total_label, LV_ALIGN_TOP_RIGHT, -8, 504);
-    }
+        /* ── row 0: 进度条 ── */
+        {
+            lv_obj_t *row = lv_obj_create(bottom);
+            lv_obj_remove_style_all(row);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(row, lv_pct(100), lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
 
-    /* ── 文件名标签 ── */
-    g_file_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(g_file_label, "---");
-    lv_obj_set_style_text_font(g_file_label,
-        &lv_font_montserrat_24, 0);
-    lv_obj_align(g_file_label, LV_ALIGN_TOP_MID, 0, 535);
+            g_time_cur_label = lv_label_create(row);
+            lv_label_set_text(g_time_cur_label, "00:00");
+            lv_obj_set_style_text_font(g_time_cur_label,
+                &lv_font_montserrat_14, 0);
+            lv_obj_set_width(g_time_cur_label, 50);
 
-    /* ── 控制按钮 ── */
-    {
-        lv_obj_t *btn, *lbl;
-        int bw = 82, bh = 56, gap = 18;
-        int total_w = bw * 3 + gap * 2;
-        int x0 = (480 - total_w) / 2;
+            g_progress_slider = lv_slider_create(row);
+            lv_obj_set_flex_grow(g_progress_slider, 1);
+            lv_obj_set_height(g_progress_slider, 10);
+            lv_slider_set_range(g_progress_slider, 0, 1000);
+            lv_obj_set_style_pad_hor(g_progress_slider, 8, 0);
 
-        btn = lv_btn_create(lv_scr_act());
-        lv_obj_set_size(btn, bw, bh);
-        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x0, 578);
-        lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, LV_SYMBOL_PREV);
-        lv_obj_center(lbl);
-        lv_obj_add_event_cb(btn, btn_prev_cb, LV_EVENT_CLICKED, NULL);
+            g_time_total_label = lv_label_create(row);
+            lv_label_set_text(g_time_total_label, "00:00");
+            lv_obj_set_style_text_font(g_time_total_label,
+                &lv_font_montserrat_14, 0);
+            lv_obj_set_width(g_time_total_label, 50);
 
-        btn = lv_btn_create(lv_scr_act());
-        lv_obj_set_size(btn, bw, bh);
-        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x0 + bw + gap, 578);
-        g_pp_btn_label = lv_label_create(btn);
-        lv_label_set_text(g_pp_btn_label, LV_SYMBOL_PAUSE);
-        lv_obj_center(g_pp_btn_label);
-        lv_obj_add_event_cb(btn, btn_pp_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
+                                 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+        }
 
-        btn = lv_btn_create(lv_scr_act());
-        lv_obj_set_size(btn, bw, bh);
-        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x0 + (bw + gap) * 2, 578);
-        lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, LV_SYMBOL_NEXT);
-        lv_obj_center(lbl);
-        lv_obj_add_event_cb(btn, btn_next_cb, LV_EVENT_CLICKED, NULL);
-    }
+        /* ── row 1: 文件名 ── */
+        {
+            lv_obj_t *row = lv_obj_create(bottom);
+            lv_obj_remove_style_all(row);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(row, lv_pct(100), lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
 
-    /* ── 音量控制 ── */
-    {
-        lv_obj_t *btn_minus, *btn_plus, *lbl;
+            g_file_label = lv_label_create(row);
+            lv_label_set_text(g_file_label, "---");
+            lv_obj_set_style_text_font(g_file_label,
+                &lv_font_montserrat_24, 0);
+            lv_label_set_long_mode(g_file_label,
+                LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_width(g_file_label, 440);
 
-        btn_minus = lv_btn_create(lv_scr_act());
-        lv_obj_set_size(btn_minus, 50, 50);
-        lv_obj_align(btn_minus, LV_ALIGN_TOP_LEFT, 42, 653);
-        lbl = lv_label_create(btn_minus);
-        lv_label_set_text(lbl, LV_SYMBOL_MINUS);
-        lv_obj_center(lbl);
-        lv_obj_add_event_cb(btn_minus, vol_step_down_cb,
-            LV_EVENT_CLICKED, NULL);
+            lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
+                                 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
+        }
 
-        g_vol_label = lv_label_create(lv_scr_act());
-        lv_label_set_text(g_vol_label, LV_SYMBOL_VOLUME_MID);
-        lv_obj_set_style_text_font(g_vol_label,
-            &lv_font_montserrat_32, 0);
-        lv_obj_align_to(g_vol_label, btn_minus,
-            LV_ALIGN_OUT_LEFT_MID, -10, 0);
+        /* ── row 2: 控制按钮 ── */
+        {
+            lv_obj_t *row = lv_obj_create(bottom);
+            lv_obj_remove_style_all(row);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(row, lv_pct(100), lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 14, 0);
 
-        g_vol_slider = lv_slider_create(lv_scr_act());
-        lv_obj_set_size(g_vol_slider, 250, 12);
-        lv_obj_align(g_vol_slider, LV_ALIGN_TOP_MID, 0, 672);
-        lv_slider_set_range(g_vol_slider, 0, 14);
-        lv_obj_add_event_cb(g_vol_slider, vol_slider_cb,
-            LV_EVENT_VALUE_CHANGED, NULL);
+            lv_obj_t *btn, *lbl;
+            int btn_w = 80, btn_h = 54;
 
-        btn_plus = lv_btn_create(lv_scr_act());
-        lv_obj_set_size(btn_plus, 50, 50);
-        lv_obj_align(btn_plus, LV_ALIGN_TOP_RIGHT, -40, 653);
-        lbl = lv_label_create(btn_plus);
-        lv_label_set_text(lbl, LV_SYMBOL_PLUS);
-        lv_obj_center(lbl);
-        lv_obj_add_event_cb(btn_plus, vol_step_up_cb,
-            LV_EVENT_CLICKED, NULL);
+            btn = lv_btn_create(row);
+            lv_obj_set_size(btn, btn_w, btn_h);
+            lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, LV_SYMBOL_PREV);
+            lv_obj_center(lbl);
+            lv_obj_add_event_cb(btn, btn_prev_cb, LV_EVENT_CLICKED, NULL);
+
+            btn = lv_btn_create(row);
+            lv_obj_set_size(btn, btn_w, btn_h);
+            g_pp_btn_label = lv_label_create(btn);
+            lv_label_set_text(g_pp_btn_label, LV_SYMBOL_PAUSE);
+            lv_obj_center(g_pp_btn_label);
+            lv_obj_add_event_cb(btn, btn_pp_cb, LV_EVENT_CLICKED, NULL);
+
+            btn = lv_btn_create(row);
+            lv_obj_set_size(btn, btn_w, btn_h);
+            lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, LV_SYMBOL_NEXT);
+            lv_obj_center(lbl);
+            lv_obj_add_event_cb(btn, btn_next_cb, LV_EVENT_CLICKED, NULL);
+
+            lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
+                                 0, 1, LV_GRID_ALIGN_CENTER, 2, 1);
+        }
+
+        /* ── row 3: 音量控制 ── */
+        {
+            lv_obj_t *row = lv_obj_create(bottom);
+            lv_obj_remove_style_all(row);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(row, lv_pct(100), lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 8, 0);
+
+            g_vol_label = lv_label_create(row);
+            lv_label_set_text(g_vol_label, LV_SYMBOL_VOLUME_MID);
+            lv_obj_set_style_text_font(g_vol_label,
+                &lv_font_montserrat_24, 0);
+            lv_obj_set_width(g_vol_label, 36);
+
+            lv_obj_t *btn, *lbl;
+
+            btn = lv_btn_create(row);
+            lv_obj_set_size(btn, 44, 44);
+            lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, LV_SYMBOL_MINUS);
+            lv_obj_center(lbl);
+            lv_obj_add_event_cb(btn, vol_step_down_cb,
+                LV_EVENT_CLICKED, NULL);
+
+            g_vol_slider = lv_slider_create(row);
+            lv_obj_set_flex_grow(g_vol_slider, 1);
+            lv_obj_set_height(g_vol_slider, 10);
+            lv_slider_set_range(g_vol_slider, 0, 14);
+            lv_obj_add_event_cb(g_vol_slider, vol_slider_cb,
+                LV_EVENT_VALUE_CHANGED, NULL);
+            lv_obj_set_style_pad_hor(g_vol_slider, 8, 0);
+
+            btn = lv_btn_create(row);
+            lv_obj_set_size(btn, 44, 44);
+            lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, LV_SYMBOL_PLUS);
+            lv_obj_center(lbl);
+            lv_obj_add_event_cb(btn, vol_step_up_cb,
+                LV_EVENT_CLICKED, NULL);
+
+            lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
+                                 0, 1, LV_GRID_ALIGN_CENTER, 3, 1);
+        }
+
+        /* ── row 5: 播放列表按钮 (左下角) ── */
+        {
+            lv_obj_t *row = lv_obj_create(bottom);
+            lv_obj_remove_style_all(row);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(row, lv_pct(100), lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                  LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_all(row, 4, 0);
+
+            g_list_btn = lv_btn_create(row);
+            lv_obj_set_size(g_list_btn, 80, 54);
+            lv_obj_t *lbl2 = lv_label_create(g_list_btn);
+            lv_label_set_text(lbl2, LV_SYMBOL_LIST);
+            lv_obj_center(lbl2);
+            lv_obj_add_event_cb(g_list_btn, list_btn_cb,
+                LV_EVENT_CLICKED, NULL);
+
+            lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
+                                 0, 1, LV_GRID_ALIGN_CENTER, 5, 1);
+        }
     }
 
 #if 0
@@ -1262,7 +1621,7 @@ int main(int argc, char *argv[])
     pcm_warmup();
 
     while (!g_quit) {
-        char *file = g_playlist[g_playlist_index];
+        char *file = g_playlist[g_playlist_index].path;
         int is_video = has_video_ext(file);
 
         struct audio_player_ctx aptx;
@@ -1309,6 +1668,25 @@ int main(int argc, char *argv[])
         g_switch_file = 0;
         while (!g_quit && !g_switch_file && g_skip_dir == 0) {
             lv_tick_inc(5);
+
+            /* 播放列表浮层打开时：更新进度但跳过视频渲染 */
+            if (g_playlist_open) {
+                double cur = is_video ? g_astx.clock : aptx.clock;
+                if (g_duration > 0.01) {
+                    int v = (int)(cur / g_duration * 1000.0);
+                    if (v < 0) v = 0; if (v > 1000) v = 1000;
+                    lv_slider_set_value(g_progress_slider, v,
+                                        LV_ANIM_OFF);
+                    char tbuf[16];
+                    format_time((int)cur, tbuf, sizeof(tbuf));
+                    lv_label_set_text(g_time_cur_label, tbuf);
+                    format_time((int)g_duration, tbuf, sizeof(tbuf));
+                    lv_label_set_text(g_time_total_label, tbuf);
+                }
+                lv_task_handler();
+                usleep(10000);
+                continue;
+            }
 
             if (g_pause) {
                 lv_task_handler();
