@@ -53,6 +53,8 @@ int main()
 #include <dirent.h>
 #include <strings.h>
 
+#include <lvgl/src/extra/libs/freetype/lv_freetype.h>
+
 #define CANVAS_W    480
 #define CANVAS_H    480
 #define MEDIA_DIR   "/mnt/sdcard"
@@ -60,6 +62,8 @@ int main()
 #define AUDIO_OUT_CHANNELS 2
 #define AUDIO_OUT_BUF_SAMPLES 8192
 #define AUDIO_QUEUE_SIZE   16
+
+#define CJK_FONT  "/usr/share/resource/SmileySans-Oblique.ttf"
 
 /* ── 播放列表项 ── */
 struct pl_item {
@@ -148,6 +152,10 @@ static int           g_playlist_open;
 static snd_ctl_t          *g_ctl;
 static snd_ctl_elem_id_t  *g_ctl_id;
 static long                g_ctl_vol_min, g_ctl_vol_max;
+
+/* ── CJK 字体 ── */
+static lv_ft_info_t g_cjk_24;
+static lv_ft_info_t g_cjk_20;
 
 /* ── AV 同步 ── */
 #define VIDEO_PKT_QUEUE_SIZE 8
@@ -404,6 +412,33 @@ static void vol_slider_cb(lv_event_t *e)
     vol_apply(step);
 }
 
+/* CJK 字体初始化 */
+static void cjk_font_init(void)
+{
+    if (access(CJK_FONT, F_OK) != 0) {
+        printf("[font] %s not found, fallback to builtin\n", CJK_FONT);
+        return;
+    }
+
+    if (!lv_freetype_init(64, 2, 0)) {
+        printf("[font] freetype init failed\n");
+        return;
+    }
+
+    g_cjk_24.name   = CJK_FONT;
+    g_cjk_24.weight = 24;
+    g_cjk_24.style  = FT_FONT_STYLE_NORMAL;
+    lv_ft_font_init(&g_cjk_24);
+
+    g_cjk_20.name   = CJK_FONT;
+    g_cjk_20.weight = 20;
+    g_cjk_20.style  = FT_FONT_STYLE_NORMAL;
+    lv_ft_font_init(&g_cjk_20);
+
+    printf("[font] CJK loaded (24pt=%p 20pt=%p)\n",
+           (void *)g_cjk_24.font, (void *)g_cjk_20.font);
+}
+
 /* 探测文件时长（秒），0 表示失败 */
 static double probe_duration(const char *path)
 {
@@ -564,7 +599,7 @@ static void playlist_page_create(void)
         lv_obj_t *nm_lbl = lv_label_create(item);
         lv_label_set_text(nm_lbl, name);
         lv_obj_set_style_text_color(nm_lbl, lv_color_hex(0xE0E0E0), 0);
-        lv_obj_set_style_text_font(nm_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(nm_lbl, g_cjk_20.font, 0);
         lv_obj_set_grid_cell(nm_lbl, LV_GRID_ALIGN_START,
             1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
@@ -1389,6 +1424,8 @@ int main(int argc, char *argv[])
 
     lv_port_init(480, 854, 0);
 
+    cjk_font_init();
+
     /* ── canvas ── */
     g_canvas = lv_canvas_create(lv_scr_act());
     lv_canvas_set_buffer(g_canvas, g_canvas_buf, CANVAS_W, CANVAS_H,
@@ -1478,7 +1515,7 @@ int main(int argc, char *argv[])
             g_file_label = lv_label_create(row);
             lv_label_set_text(g_file_label, "---");
             lv_obj_set_style_text_font(g_file_label,
-                &lv_font_montserrat_24, 0);
+                g_cjk_24.font, 0);
             lv_label_set_long_mode(g_file_label,
                 LV_LABEL_LONG_SCROLL_CIRCULAR);
             lv_obj_set_width(g_file_label, 440);
