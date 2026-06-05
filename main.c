@@ -100,7 +100,7 @@ static pthread_cond_t  g_audio_cond;
 
 /* ── 全局状态 ── */
 static int               g_quit;
-static lv_color_t        g_canvas_buf[CANVAS_W * CANVAS_H];
+static lv_color_t        __attribute__((aligned(64))) g_canvas_buf[CANVAS_W * CANVAS_H];
 static lv_obj_t         *g_canvas;
 
 static pthread_t         g_vdec_tid;
@@ -108,7 +108,7 @@ static pthread_mutex_t   g_frame_lock;
 static int               g_new_frame;
 static int               g_disp_w, g_disp_h;
 static double            g_frame_interval;
-static uint8_t           g_video_buf[2][CANVAS_W * CANVAS_H * 4];
+static uint8_t           __attribute__((aligned(64))) g_video_buf[2][CANVAS_W * CANVAS_H * 4];
 static int               g_video_buf_idx;
 
 /* ── 播放列表 ── */
@@ -1096,17 +1096,14 @@ static int audio_player_init(const char *filename,
     return 0;
 }
 
-static int probe_has_video(const char *filename)
+static int has_video_ext(const char *filename)
 {
-    AVFormatContext *fmt = NULL;
-    int has = 0;
-    if (avformat_open_input(&fmt, filename, NULL, NULL) >= 0) {
-        avformat_find_stream_info(fmt, NULL);
-        has = (av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO,
-                                   -1, -1, NULL, 0) >= 0);
-        avformat_close_input(&fmt);
-    }
-    return has;
+    const char *exts[] = { ".mp4", ".mkv", ".avi", NULL };
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return 0;
+    for (int i = 0; exts[i]; i++)
+        if (strcasecmp(ext, exts[i]) == 0) return 1;
+    return 0;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1266,7 +1263,7 @@ int main(int argc, char *argv[])
 
     while (!g_quit) {
         char *file = g_playlist[g_playlist_index];
-        int is_video = probe_has_video(file);
+        int is_video = has_video_ext(file);
 
         struct audio_player_ctx aptx;
         pthread_t aptid = 0;
