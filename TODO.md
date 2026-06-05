@@ -67,6 +67,8 @@
 - [x] 当前 `strcasecmp` 只匹配 ASCII，需支持 UTF-8 / GBK 编码的文件名（FAT32 mount 已确认 UTF-8 可用）
 - [x] LVGL 显示中文文件名（载入 SmileySans-Oblique.ttf via Freetype，覆盖简繁中文/日文假名/拉丁）
 - [x] SD 卡常见编码：FAT32 用 GBK，ext4 用 UTF-8，需自动检测或兼容（内核 iocharset=utf8 即可，当前 card 已支持）
+- [x] LVGL 内存池从 48KB 扩展为系统 malloc（buildroot .config 设 BR2_LV_MEM_CUSTOM=y）
+- [x] **固化字体到镜像**：SmileySans-Oblique.ttf 放入 buildroot overlay，重刷镜像自动包含
 
 ---
 
