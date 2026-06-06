@@ -74,10 +74,17 @@
 
 ## 屏幕常亮 & 待机策略
 
-- [ ] 视频播放时禁止息屏（写 `/sys/class/graphics/fb0/blank` 或 DRM DPMS）
-- [ ] 纯音频播放时允许按系统设定息屏
-- [ ] 暂停超过 N 分钟进入低功耗待机
-- [ ] 触摸唤醒后恢复播放
+- [x] 背光 x 秒无触摸自动灭屏（`/sys/.../brightness` 写 0）
+- [x] 触摸唤醒（第一次触摸只亮屏不触发 UI 操作）
+- [x] 延时/亮度可调（lv_menu 设置页）
+- [x] 配置持久化（BL_TIMEOUT / BL_BRIGHTNESS 存入 player.conf）
+
+## 设置菜单
+
+- [x] 右下角 ⚙ 按钮 → lv_menu 全屏设置页
+- [x] 熄屏延时：5s / 10s / 30s / 60s / Never
+- [x] 背光亮度：slider 10~255
+- [x] 关于本机：版本信息页
 
 ---
 

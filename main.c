@@ -157,6 +157,19 @@ static long                g_ctl_vol_min, g_ctl_vol_max;
 static lv_ft_info_t g_cjk_24;
 static lv_ft_info_t g_cjk_20;
 
+/* ── 背光控制 ── */
+#define BACKLIGHT_NODE "/sys/devices/platform/backlight/backlight/backlight/brightness"
+static int  g_bl_fd         = -1;
+static int  g_bl_timeout    = 10;
+static int  g_bl_brightness = 200;
+static int  g_bl_last_touch;
+static int  g_bl_on         = 1;
+static lv_timer_t *g_bl_timer;
+
+/* ── 设置菜单 ── */
+static lv_obj_t *g_overlay_page;
+static lv_obj_t *g_settings_btn;
+
 /* ── AV 同步 ── */
 #define VIDEO_PKT_QUEUE_SIZE 8
 static AVPacket g_video_pkt_queue[VIDEO_PKT_QUEUE_SIZE];
@@ -187,6 +200,7 @@ static void btn_quit_cb(lv_event_t *e)
 static void btn_pp_cb(lv_event_t *e)
 {
     (void)e;
+    g_bl_last_touch = lv_tick_get();
     g_pause = !g_pause;
     lv_label_set_text(g_pp_btn_label, g_pause ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
 }
@@ -194,6 +208,7 @@ static void btn_pp_cb(lv_event_t *e)
 static void btn_prev_cb(lv_event_t *e)
 {
     (void)e;
+    g_bl_last_touch = lv_tick_get();
     if (g_playlist_open) {
         if (g_probe_timer) {
             lv_timer_del(g_probe_timer);
@@ -209,6 +224,7 @@ static void btn_prev_cb(lv_event_t *e)
 static void btn_next_cb(lv_event_t *e)
 {
     (void)e;
+    g_bl_last_touch = lv_tick_get();
     if (g_playlist_open) {
         if (g_probe_timer) {
             lv_timer_del(g_probe_timer);
@@ -270,6 +286,8 @@ static void save_config(int step, int index)
     if (!f) return;
     fprintf(f, "VOLUME=%d\n", step);
     fprintf(f, "INDEX=%d\n", index);
+    fprintf(f, "BL_TIMEOUT=%d\n", g_bl_timeout);
+    fprintf(f, "BL_BRIGHTNESS=%d\n", g_bl_brightness);
     fclose(f);
 }
 
@@ -282,6 +300,8 @@ static int load_config(int *out_index)
     while (fgets(line, sizeof(line), f)) {
         sscanf(line, "INDEX=%d", &index);
         sscanf(line, "VOLUME=%d", &step);
+        sscanf(line, "BL_TIMEOUT=%d", &g_bl_timeout);
+        sscanf(line, "BL_BRIGHTNESS=%d", &g_bl_brightness);
     }
     fclose(f);
     if (out_index) *out_index = index;
@@ -410,6 +430,303 @@ static void vol_slider_cb(lv_event_t *e)
     if (!g_vol_init_done) return;
     int step = (int)lv_slider_get_value(g_vol_slider);
     vol_apply(step);
+}
+
+/* ═══ 背光控制 ═══ */
+
+static void backlight_write(int value)
+{
+    if (g_bl_fd < 0) return;
+    dprintf(g_bl_fd, "%d\n", value);
+}
+
+static void backlight_init(void)
+{
+    g_bl_fd = open(BACKLIGHT_NODE, O_WRONLY);
+    if (g_bl_fd < 0) {
+        printf("[bl] open failed\n");
+        return;
+    }
+    backlight_write(g_bl_brightness);
+    printf("[bl] init ok, brightness=%d\n", g_bl_brightness);
+}
+
+static void touch_feedback_cb(lv_indev_drv_t *drv, uint8_t event)
+{
+    (void)drv;
+    if (event >= LV_EVENT_PRESSED && event <= LV_EVENT_RELEASED)
+        g_bl_last_touch = lv_tick_get();
+}
+
+static void backlight_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (g_bl_on) {
+        if (g_bl_timeout == 0) return;
+        if (lv_tick_elaps(g_bl_last_touch) > g_bl_timeout * 1000) {
+            backlight_write(0);
+            lv_indev_enable(NULL, 0);
+            g_bl_on = 0;
+        }
+        return;
+    }
+
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    lv_indev_data_t data;
+    while (indev) {
+        _lv_indev_read(indev, &data);
+        if (data.state == LV_INDEV_STATE_PRESSED) {
+            uint32_t t = lv_tick_get();
+            do {
+                _lv_indev_read(indev, &data);
+                if (lv_tick_elaps(t) > 10000) break;
+            } while (data.state == LV_INDEV_STATE_PRESSED);
+
+            backlight_write(g_bl_brightness);
+            lv_indev_enable(NULL, 1);
+            g_bl_on = 1;
+            g_bl_last_touch = lv_tick_get();
+            break;
+        }
+        indev = lv_indev_get_next(indev);
+    }
+}
+
+/* ═══ 设置页 (overlay) ═══ */
+
+static const int g_timeout_vals[] = {5, 10, 30, 60, 0};
+static const char *g_timeout_names[] = {"5s","10s","30s","60s","Never"};
+
+static void settings_page_create(void);
+static void settings_back_cb(lv_event_t *e);
+static void settings_enter_cb(lv_event_t *e);
+static void settings_btn_cb(lv_event_t *e);
+
+static void settings_timeout_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    g_bl_timeout = g_timeout_vals[idx];
+
+    lv_obj_del(g_overlay_page);
+    g_overlay_page = NULL;
+    settings_page_create();
+    save_config((int)lv_slider_get_value(g_vol_slider), g_playlist_index);
+}
+
+static void settings_brightness_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    g_bl_brightness = (int)lv_slider_get_value(slider);
+    backlight_write(g_bl_brightness);
+    lv_obj_t *lbl = lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "%d / 255", g_bl_brightness);
+    save_config((int)lv_slider_get_value(g_vol_slider), g_playlist_index);
+}
+
+static void settings_timeout_page_create(void)
+{
+    g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_overlay_page, 480, 854);
+    lv_obj_set_style_bg_color(g_overlay_page, lv_color_hex(0x1E1E2E), 0);
+    lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(g_overlay_page, 0, 0);
+    lv_obj_set_style_border_width(g_overlay_page, 0, 0);
+
+    lv_obj_t *title = lv_label_create(g_overlay_page);
+    lv_label_set_text(title, "Screen Off");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 12);
+
+    lv_obj_t *back_btn = lv_btn_create(g_overlay_page);
+    lv_obj_set_size(back_btn, 44, 44);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, settings_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cont = lv_obj_create(g_overlay_page);
+    lv_obj_set_size(cont, 470, 750);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 8, 0);
+    lv_obj_set_style_pad_row(cont, 8, 0);
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *btn = lv_btn_create(cont);
+        lv_obj_set_size(btn, lv_pct(100), 48);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, g_timeout_names[i]);
+        lv_obj_center(lbl);
+        lv_obj_add_event_cb(btn, settings_timeout_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+}
+
+static void settings_brightness_page_create(void)
+{
+    g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_overlay_page, 480, 854);
+    lv_obj_set_style_bg_color(g_overlay_page, lv_color_hex(0x1E1E2E), 0);
+    lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(g_overlay_page, 0, 0);
+    lv_obj_set_style_border_width(g_overlay_page, 0, 0);
+
+    lv_obj_t *title = lv_label_create(g_overlay_page);
+    lv_label_set_text(title, "Brightness");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 12);
+
+    lv_obj_t *back_btn = lv_btn_create(g_overlay_page);
+    lv_obj_set_size(back_btn, 44, 44);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, settings_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lbl = lv_label_create(g_overlay_page);
+    lv_label_set_text_fmt(lbl, "%d / 255", g_bl_brightness);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xE0E0E0), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -30);
+
+    lv_obj_t *slider = lv_slider_create(g_overlay_page);
+    lv_obj_set_size(slider, 350, 14);
+    lv_slider_set_range(slider, 10, 255);
+    lv_slider_set_value(slider, g_bl_brightness, LV_ANIM_OFF);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 30);
+    lv_obj_add_event_cb(slider, settings_brightness_cb,
+                        LV_EVENT_VALUE_CHANGED, lbl);
+}
+
+static void settings_about_page_create(void)
+{
+    g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_overlay_page, 480, 854);
+    lv_obj_set_style_bg_color(g_overlay_page, lv_color_hex(0x1E1E2E), 0);
+    lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(g_overlay_page, 0, 0);
+    lv_obj_set_style_border_width(g_overlay_page, 0, 0);
+
+    lv_obj_t *title = lv_label_create(g_overlay_page);
+    lv_label_set_text(title, "About");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 12);
+
+    lv_obj_t *back_btn = lv_btn_create(g_overlay_page);
+    lv_obj_set_size(back_btn, 44, 44);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, settings_back_cb, LV_EVENT_CLICKED, NULL);
+
+    static const char *lines[] = {
+        "my_player", "", "SDK: RK3506 Linux 6.1",
+        "Display: 480x854", "LVGL: 8.4.0", "Buildroot + FFmpeg", NULL
+    };
+    for (int i = 0; lines[i]; i++) {
+        lv_obj_t *lbl = lv_label_create(g_overlay_page);
+        lv_label_set_text(lbl, lines[i]);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xC0C0C0), 0);
+        lv_obj_set_style_text_font(lbl,
+            i == 0 ? &lv_font_montserrat_24 : &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 80 + i * 40);
+    }
+}
+
+static void settings_page_create(void)
+{
+    g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_overlay_page, 480, 854);
+    lv_obj_set_style_bg_color(g_overlay_page, lv_color_hex(0x1E1E2E), 0);
+    lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(g_overlay_page, 0, 0);
+    lv_obj_set_style_border_width(g_overlay_page, 0, 0);
+
+    lv_obj_t *title = lv_label_create(g_overlay_page);
+    lv_label_set_text(title, "Settings");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 12);
+
+    lv_obj_t *close_btn = lv_btn_create(g_overlay_page);
+    lv_obj_set_size(close_btn, 44, 44);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, settings_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cont = lv_obj_create(g_overlay_page);
+    lv_obj_set_size(cont, 470, 750);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 8, 0);
+    lv_obj_set_style_pad_row(cont, 8, 0);
+
+    char buf[64];
+    const char *cur_to = "Never";
+    for (int i = 0; i < 5; i++)
+        if (g_bl_timeout == g_timeout_vals[i]) { cur_to = g_timeout_names[i]; break; }
+    snprintf(buf, sizeof(buf), "Screen off:  %s", cur_to);
+    lv_obj_t *btn1 = lv_btn_create(cont);
+    lv_obj_set_size(btn1, lv_pct(100), 50);
+    lv_obj_t *lbl1 = lv_label_create(btn1);
+    lv_label_set_text(lbl1, buf);
+    lv_obj_add_event_cb(btn1, settings_enter_cb, LV_EVENT_CLICKED, (void *)0);
+
+    snprintf(buf, sizeof(buf), "Brightness:  %d/255", g_bl_brightness);
+    lv_obj_t *btn2 = lv_btn_create(cont);
+    lv_obj_set_size(btn2, lv_pct(100), 50);
+    lv_obj_t *lbl2 = lv_label_create(btn2);
+    lv_label_set_text(lbl2, buf);
+    lv_obj_add_event_cb(btn2, settings_enter_cb, LV_EVENT_CLICKED, (void *)1);
+
+    lv_obj_t *btn3 = lv_btn_create(cont);
+    lv_obj_set_size(btn3, lv_pct(100), 50);
+    lv_obj_t *lbl3 = lv_label_create(btn3);
+    lv_label_set_text(lbl3, "About");
+    lv_obj_add_event_cb(btn3, settings_enter_cb, LV_EVENT_CLICKED, (void *)2);
+}
+
+static void settings_enter_cb(lv_event_t *e)
+{
+    int page = (int)(intptr_t)lv_event_get_user_data(e);
+    lv_obj_del(g_overlay_page);
+    g_overlay_page = NULL;
+    if (page == 0)      settings_timeout_page_create();
+    else if (page == 1) settings_brightness_page_create();
+    else                settings_about_page_create();
+}
+
+static void settings_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_overlay_page) { lv_obj_del(g_overlay_page); g_overlay_page = NULL; }
+    settings_page_create();
+}
+
+static void settings_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_overlay_page) {
+        lv_obj_del(g_overlay_page);
+        g_overlay_page = NULL;
+    } else {
+        settings_page_create();
+    }
 }
 
 /* CJK 字体初始化 */
@@ -1426,6 +1743,18 @@ int main(int argc, char *argv[])
 
     cjk_font_init();
 
+    /* 背光 + 触摸唤醒 */
+    backlight_init();
+    {
+        lv_indev_t *indev = lv_indev_get_next(NULL);
+        while (indev) {
+            indev->driver->feedback_cb = touch_feedback_cb;
+            indev = lv_indev_get_next(indev);
+        }
+        g_bl_last_touch = lv_tick_get();
+        g_bl_timer = lv_timer_create(backlight_timer_cb, 50, NULL);
+    }
+
     /* ── canvas ── */
     g_canvas = lv_canvas_create(lv_scr_act());
     lv_canvas_set_buffer(g_canvas, g_canvas_buf, CANVAS_W, CANVAS_H,
@@ -1612,25 +1941,34 @@ int main(int argc, char *argv[])
                                  0, 1, LV_GRID_ALIGN_CENTER, 3, 1);
         }
 
-        /* ── row 5: 播放列表按钮 (左下角) ── */
+        /* ── row 5: 播放列表(左) + 设置(右) ── */
         {
             lv_obj_t *row = lv_obj_create(bottom);
             lv_obj_remove_style_all(row);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_size(row, lv_pct(100), lv_pct(100));
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                                   LV_FLEX_ALIGN_CENTER,
                                   LV_FLEX_ALIGN_CENTER);
             lv_obj_set_style_pad_all(row, 4, 0);
 
+            /* 播放列表按钮 (左) */
             g_list_btn = lv_btn_create(row);
             lv_obj_set_size(g_list_btn, 80, 54);
-            lv_obj_t *lbl2 = lv_label_create(g_list_btn);
-            lv_label_set_text(lbl2, LV_SYMBOL_LIST);
+            lv_obj_t *lbl = lv_label_create(g_list_btn);
+            lv_label_set_text(lbl, LV_SYMBOL_LIST);
+            lv_obj_center(lbl);
+            lv_obj_add_event_cb(g_list_btn, list_btn_cb, LV_EVENT_CLICKED, NULL);
+
+            /* 设置按钮 (右) */
+            g_settings_btn = lv_btn_create(row);
+            lv_obj_set_size(g_settings_btn, 80, 54);
+            lv_obj_t *lbl2 = lv_label_create(g_settings_btn);
+            lv_label_set_text(lbl2, LV_SYMBOL_SETTINGS);
             lv_obj_center(lbl2);
-            lv_obj_add_event_cb(g_list_btn, list_btn_cb,
-                LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(g_settings_btn, settings_btn_cb,
+                                LV_EVENT_CLICKED, NULL);
 
             lv_obj_set_grid_cell(row, LV_GRID_ALIGN_STRETCH,
                                  0, 1, LV_GRID_ALIGN_CENTER, 5, 1);
