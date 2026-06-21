@@ -1,0 +1,28 @@
+#!/bin/sh
+
+case "$1" in
+        start)
+                echo "Starting my_player..."
+                # 等待 SD 卡挂载
+                for i in $(seq 1 30); do
+                        [ -d /mnt/sdcard ] && break
+                        sleep 1
+                done
+                /usr/bin/play &
+                ;;
+        stop)
+                echo "Stopping my_player..."
+                killall play 2>/dev/null
+                killall -9 ffmpeg 2>/dev/null
+                ;;
+        restart|reload)
+                $0 stop
+                sleep 1
+                $0 start
+                ;;
+        *)
+                echo "Usage: $0 {start|stop|restart}"
+                exit 1
+esac
+
+exit 0

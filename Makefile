@@ -1,4 +1,5 @@
 OUT := $(HOME)/rk3506_linux6.1_sdk_v1.2.0/buildroot/output/rockchip_hd_rk3506g_evm_nand
+OVERLAY := $(HOME)/rk3506_linux6.1_sdk_v1.2.0/buildroot/board/vanxoak/hd_rk3506g_evm_nand/fs-overlay
 SYSROOT := $(OUT)/host/arm-buildroot-linux-gnueabihf/sysroot
 CC  := $(OUT)/host/bin/arm-buildroot-linux-gnueabihf-gcc
 
@@ -17,10 +18,13 @@ LIBS := -llvgl -llv_drivers -lrkadk -lrockit -levdev -ldrm -lrga -lfreetype \
 SRCS := $(filter-out lvgl/%, $(wildcard *.c))
 OBJS := $(SRCS:.c=.o)
 
-all: play
+all: install
 
 play: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+install: play
+	cp play $(OVERLAY)/usr/bin/play
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(DEFINES) -c -o $@ $<

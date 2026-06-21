@@ -71,6 +71,11 @@ void evdev_sensor_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
 
 #endif
 
+extern int g_evdev_raw_x;
+extern int g_evdev_raw_y;
+extern int g_touch_offset_x;
+extern int g_touch_offset_y;
+
 #ifdef __cplusplus
 } /*extern "C"*/
 #endif

@@ -170,6 +170,18 @@ static lv_timer_t *g_bl_timer;
 static lv_obj_t *g_overlay_page;
 static lv_obj_t *g_settings_btn;
 
+/* ── 触摸校准 ── */
+static int g_cal_step;
+static int g_cal_expect_x[5];
+static int g_cal_expect_y[5];
+static int g_cal_actual_x[5];
+static int g_cal_actual_y[5];
+static lv_obj_t *g_cal_target;
+static lv_obj_t *g_cal_title;   /* "Tap target X/5" 标题，切换时删掉重建 */
+
+extern int g_evdev_raw_x;
+extern int g_evdev_raw_y;
+
 /* ── AV 同步 ── */
 #define VIDEO_PKT_QUEUE_SIZE 8
 static AVPacket g_video_pkt_queue[VIDEO_PKT_QUEUE_SIZE];
@@ -502,6 +514,8 @@ static void settings_page_create(void);
 static void settings_back_cb(lv_event_t *e);
 static void settings_enter_cb(lv_event_t *e);
 static void settings_btn_cb(lv_event_t *e);
+static void calibration_page_create(void);
+static void calibration_target_cb(lv_event_t *e);
 
 static void settings_timeout_cb(lv_event_t *e)
 {
@@ -527,6 +541,9 @@ static void settings_brightness_cb(lv_event_t *e)
 static void settings_timeout_page_create(void)
 {
     g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_clear_flag(g_overlay_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(g_overlay_page, LV_DIR_NONE);
+    lv_obj_set_style_pad_all(g_overlay_page, 0, 0); 
     lv_obj_set_size(g_overlay_page, 480, 854);
     lv_obj_set_style_bg_color(g_overlay_page, lv_color_hex(0x1E1E2E), 0);
     lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
@@ -699,6 +716,12 @@ static void settings_page_create(void)
     lv_obj_t *lbl3 = lv_label_create(btn3);
     lv_label_set_text(lbl3, "About");
     lv_obj_add_event_cb(btn3, settings_enter_cb, LV_EVENT_CLICKED, (void *)2);
+
+    lv_obj_t *btn4 = lv_btn_create(cont);
+    lv_obj_set_size(btn4, lv_pct(100), 50);
+    lv_obj_t *lbl4 = lv_label_create(btn4);
+    lv_label_set_text(lbl4, "Touch Calibration");
+    lv_obj_add_event_cb(btn4, settings_enter_cb, LV_EVENT_CLICKED, (void *)3);
 }
 
 static void settings_enter_cb(lv_event_t *e)
@@ -708,7 +731,8 @@ static void settings_enter_cb(lv_event_t *e)
     g_overlay_page = NULL;
     if (page == 0)      settings_timeout_page_create();
     else if (page == 1) settings_brightness_page_create();
-    else                settings_about_page_create();
+    else if (page == 2) settings_about_page_create();
+    else if (page == 3) calibration_page_create();
 }
 
 static void settings_back_cb(lv_event_t *e)
@@ -726,6 +750,125 @@ static void settings_btn_cb(lv_event_t *e)
         g_overlay_page = NULL;
     } else {
         settings_page_create();
+    }
+}
+
+static void calibration_page_create(void)
+{
+    g_cal_step = 0;
+
+    g_cal_expect_x[0] = 48;   g_cal_expect_y[0] = 85;
+    g_cal_expect_x[1] = 432;  g_cal_expect_y[1] = 85;
+    g_cal_expect_x[2] = 432;  g_cal_expect_y[2] = 768;
+    g_cal_expect_x[3] = 48;   g_cal_expect_y[3] = 768;
+    g_cal_expect_x[4] = 240;  g_cal_expect_y[4] = 427;
+
+    g_overlay_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_overlay_page, 480, 854);
+    lv_obj_set_style_bg_color(g_overlay_page, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(g_overlay_page, LV_OPA_COVER, 0);
+
+    g_cal_title = lv_label_create(g_overlay_page);
+    lv_label_set_text(g_cal_title, "Tap target 1/5");
+    lv_obj_set_style_text_font(g_cal_title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(g_cal_title, lv_color_black(), 0);
+    lv_obj_align(g_cal_title, LV_ALIGN_TOP_MID, 0, 10);
+
+    /* 靶标：Canvas 手绘红圈 + 十字 */
+    static lv_color_t g_cal_cbuf[LV_CANVAS_BUF_SIZE_TRUE_COLOR(44, 44)];
+    g_cal_target = lv_canvas_create(g_overlay_page);
+    lv_canvas_set_buffer(g_cal_target, g_cal_cbuf, 44, 44, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(g_cal_target, lv_color_hex(0xFFFFFF), LV_OPA_TRANSP);
+
+    /* 圆: 40x40 at (2,2), radius=20 → 完美圆 */
+    lv_draw_rect_dsc_t rect_dsc;
+    lv_draw_rect_dsc_init(&rect_dsc);
+    rect_dsc.bg_opa = LV_OPA_TRANSP;
+    rect_dsc.border_color = lv_color_hex(0xFF0000);
+    rect_dsc.border_width = 2;
+    rect_dsc.border_opa = LV_OPA_COVER;
+    rect_dsc.radius = 20;
+    lv_canvas_draw_rect(g_cal_target, 2, 2, 40, 40, &rect_dsc);
+
+    /* 竖线: 上顶点(22,2) → 下顶点(22,42) */
+    lv_point_t vline[] = {{22, 2}, {22, 42}};
+    lv_draw_line_dsc_t line_dsc;
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.color = lv_color_hex(0xFF0000);
+    line_dsc.width = 2;
+    line_dsc.opa = LV_OPA_COVER;
+    lv_canvas_draw_line(g_cal_target, vline, 2, &line_dsc);
+
+    /* 横线: 左顶点(2,22) → 右顶点(42,22) */
+    lv_point_t hline[] = {{2, 22}, {42, 22}};
+    lv_canvas_draw_line(g_cal_target, hline, 2, &line_dsc);
+
+    lv_obj_set_pos(g_cal_target, g_cal_expect_x[0] - 22,
+                   g_cal_expect_y[0] - 22);
+
+    lv_obj_add_flag(g_overlay_page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_overlay_page, calibration_target_cb,
+                        LV_EVENT_CLICKED, NULL);
+}
+
+static void calibration_target_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_cal_step >= 5) return;
+
+    g_cal_actual_x[g_cal_step] = g_evdev_raw_x;
+    g_cal_actual_y[g_cal_step] = g_evdev_raw_y;
+    g_cal_step++;
+
+    if (g_cal_step < 5) {
+        /* 更新标题 */
+        lv_label_set_text_fmt(g_cal_title, "Tap target %d/5", g_cal_step + 1);
+        /* 移动靶标 */
+        lv_obj_set_pos(g_cal_target,
+            g_cal_expect_x[g_cal_step] - 22,
+            g_cal_expect_y[g_cal_step] - 22);
+    } else {
+        double ox = 0, oy = 0;
+        for (int i = 0; i < 5; i++) {
+            ox += g_cal_expect_x[i] - g_cal_actual_x[i];
+            oy += g_cal_expect_y[i] - g_cal_actual_y[i];
+        }
+        ox /= 5.0;
+        oy /= 5.0;
+
+        lv_obj_del(g_cal_target);
+        g_cal_target = NULL;
+        lv_obj_del(g_cal_title);
+        g_cal_title = NULL;
+
+        lv_obj_t *res_title = lv_label_create(g_overlay_page);
+        lv_label_set_text(res_title, "Calibration Done");
+        lv_obj_set_style_text_color(res_title, lv_color_black(), 0);
+        lv_obj_set_style_text_font(res_title, &lv_font_montserrat_22, 0);
+        lv_obj_align(res_title, LV_ALIGN_TOP_MID, 0, 10);
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "offset_x = %.0f", ox);
+        lv_obj_t *lx = lv_label_create(g_overlay_page);
+        lv_label_set_text(lx, buf);
+        lv_obj_set_style_text_color(lx, lv_color_black(), 0);
+        lv_obj_set_style_text_font(lx, &lv_font_montserrat_24, 0);
+        lv_obj_align(lx, LV_ALIGN_CENTER, 0, -20);
+
+        snprintf(buf, sizeof(buf), "offset_y = %.0f", oy);
+        lv_obj_t *ly = lv_label_create(g_overlay_page);
+        lv_label_set_text(ly, buf);
+        lv_obj_set_style_text_color(ly, lv_color_black(), 0);
+        lv_obj_set_style_text_font(ly, &lv_font_montserrat_24, 0);
+        lv_obj_align(ly, LV_ALIGN_CENTER, 0, 20);
+
+        lv_obj_t *btn = lv_btn_create(g_overlay_page);
+        lv_obj_set_size(btn, 100, 50);
+        lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -40);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, LV_SYMBOL_CLOSE);
+        lv_obj_center(lbl);
+        lv_obj_add_event_cb(btn, settings_btn_cb, LV_EVENT_CLICKED, NULL);
     }
 }
 

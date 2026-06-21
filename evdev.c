@@ -64,6 +64,12 @@ static int evdev_min_y = DEFAULT_EVDEV_VER_MIN;
 static int evdev_max_y = DEFAULT_EVDEV_VER_MAX;
 static int evdev_calibrate = 0;
 static evdev_record_t evdev_val[2];
+
+int g_evdev_raw_x = 0;
+int g_evdev_raw_y = 0;
+int g_touch_offset_x = -21;  /* 触摸校准偏移，校准后手动填 */
+int g_touch_offset_y = -22;  /* 触摸校准偏移，校准后手动填 */
+
 static int touch_up = 0;
 static pthread_t evdev_tid;
 static pthread_mutex_t evdev_lock;
@@ -729,6 +735,14 @@ void evdev_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         raw_y = tmp;
         break;
     }
+    
+/* 应用触摸偏移 — 在存 raw 之前，校准 UI 直接读矫正值 */
+    raw_x += g_touch_offset_x;
+    raw_y += g_touch_offset_y;
+
+    /* 保存坐标供校准 UI 读取（已含偏移）*/
+    g_evdev_raw_x = raw_x;
+    g_evdev_raw_y = raw_y;
 
     if (evdev_calibrate)
     {

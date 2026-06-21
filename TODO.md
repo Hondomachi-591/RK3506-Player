@@ -113,6 +113,16 @@
 
 ---
 
+## 开机自启
+
+- [x] 创建 `S99player` init.d 脚本，等待 SD 卡挂载后启动 `/usr/bin/play`
+- [x] 脚本放入 Buildroot overlay：`board/vanxoak/hd_rk3506g_evm_nand/fs-overlay/etc/init.d/S99player`
+- [x] Makefile 新增 `install` 目标，`make` 时自动将 `play` 二进制复制到 overlay 的 `usr/bin/`
+- [x] 重新编译镜像后开机自启自动生效
+- [x] 临时部署：`adb push S99player /etc/init.d/` + `chmod +x`（注意 adb push 不保留执行权限）
+
+---
+
 ## 代码拆分（选做，main.c 超过 3000 行再考虑）
 
 - [ ] player_engine.h/.c — FFmpeg 解封装、解码、音视频同步、ALSA 输出
